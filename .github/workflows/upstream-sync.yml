@@ -1,0 +1,63 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository == 'sergioboi/okhttp'
+
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/square/okhttp.git
+
+      - name: Fetch upstream master
+        run: git fetch upstream master
+
+      - name: Check if sync is needed
+        id: sync_check
+        run: |
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream master
+        if: steps.sync_check.outputs.up_to_date != 'true'
+        run: |
+          git merge --no-ff --no-edit upstream/master || {
+            echo "Merge conflict while syncing upstream/master into master." >&2
+            exit 1
+          }
+
+      - name: Push merged master
+        if: steps.sync_check.outputs.up_to_date != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git remote set-url origin https://x-access-token:${GH_TOKEN}@github.com/sergioboi/okhttp.git
+          git push origin HEAD:master
