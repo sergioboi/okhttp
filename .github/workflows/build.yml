@@ -12,6 +12,9 @@ permissions:
 
 env:
   GRADLE_OPTS: "-Xmx4g -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
+  OKHTTP_GRADLE_REMOTE_CACHE_URL: ${{ secrets.OKHTTP_GRADLE_REMOTE_CACHE_URL }}
+  OKHTTP_GRADLE_REMOTE_CACHE_USER: ${{ secrets.OKHTTP_GRADLE_REMOTE_CACHE_USER }}
+  OKHTTP_GRADLE_REMOTE_CACHE_TOKEN: ${{ secrets.OKHTTP_GRADLE_REMOTE_CACHE_TOKEN }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -440,4 +443,3 @@ jobs:
 
       - name: Run with Jlink
         run: ./gradlew module-tests:imageRun -PokhttpModuleTests=true
-
