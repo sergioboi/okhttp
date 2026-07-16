@@ -23,6 +23,7 @@ import java.util.concurrent.CountDownLatch
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Dns
+import okhttp3.Dns2
 import okhttp3.HttpUrl
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
@@ -51,7 +52,10 @@ class DnsOverHttps internal constructor(
   @get:JvmName("post") val post: Boolean,
   @get:JvmName("resolvePrivateAddresses") val resolvePrivateAddresses: Boolean,
   @get:JvmName("resolvePublicAddresses") val resolvePublicAddresses: Boolean,
-) : Dns {
+) : Dns,
+  Dns2 {
+  override fun newCall(request: Dns2.Request): Dns2.Call = DnsOverHttpsCall(this, request)
+
   @Throws(UnknownHostException::class)
   override fun lookup(hostname: String): List<InetAddress> {
     if (!resolvePrivateAddresses || !resolvePublicAddresses) {
@@ -71,22 +75,17 @@ class DnsOverHttps internal constructor(
 
   @Throws(UnknownHostException::class)
   private fun lookupHttps(hostname: String): List<InetAddress> {
-    val networkRequests =
+    val calls =
       buildList {
-        add(client.newCall(buildRequest(hostname, TYPE_A)))
-
-        if (includeHttps) {
-          add(client.newCall(buildRequest(hostname, TYPE_HTTPS)))
-        }
-
+        add(createCall(hostname, TYPE_A))
         if (includeIPv6) {
-          add(client.newCall(buildRequest(hostname, TYPE_AAAA)))
+          add(createCall(hostname, TYPE_AAAA))
         }
       }
 
     val failures = ArrayList<Exception>(3)
     val results = ArrayList<InetAddress>(5)
-    executeRequests(networkRequests, results, failures)
+    executeRequests(calls, results, failures)
 
     return results.ifEmpty {
       throwBestFailure(hostname, failures)
@@ -137,7 +136,10 @@ class DnsOverHttps internal constructor(
     failures: MutableList<Exception>,
   ) {
     try {
-      val addresses = readResponse(response)
+      val addresses =
+        decodeResponse(response)
+          .filterIsInstance<ResourceRecord.IpAddress>()
+          .map { it.address }
       synchronized(results) {
         results.addAll(addresses)
       }
@@ -174,7 +176,7 @@ class DnsOverHttps internal constructor(
   }
 
   @Throws(IOException::class)
-  private fun readResponse(response: Response): List<InetAddress> {
+  internal fun decodeResponse(response: Response): List<ResourceRecord> {
     if (
       response.cacheResponse == null &&
       response.protocol !== Protocol.HTTP_2 &&
@@ -197,46 +199,44 @@ class DnsOverHttps internal constructor(
 
       val dnsResponse = DnsMessageReader(body.source()).read()
       when (dnsResponse.responseCode) {
-        RESPONSE_CODE_SUCCESS -> {
-          return dnsResponse.answers
-            .filterIsInstance<ResourceRecord.IpAddress>()
-            .map { it.address }
-        }
-
-        RESPONSE_CODE_SERVER_FAILURE -> {
-          throw UnknownHostException("DNS server failure")
-        }
-
-        else -> {
-          throw UnknownHostException()
-        }
+        RESPONSE_CODE_SUCCESS -> return dnsResponse.answers
+        RESPONSE_CODE_SERVER_FAILURE -> throw UnknownHostException("DNS server failure")
+        else -> throw UnknownHostException()
       }
     }
   }
 
-  private fun buildRequest(
+  internal fun createCall(
     hostname: String,
     type: Int,
-  ): Request =
-    Request
-      .Builder()
-      .header("Accept", DNS_MESSAGE.toString())
-      .apply {
-        val dnsUrl: HttpUrl = this@DnsOverHttps.url
-        if (post) {
-          url(dnsUrl)
-            .cacheUrlOverride(
-              dnsUrl
-                .newBuilder()
-                .addQueryParameter("hostname", hostname)
-                .build(),
-            ).post(QueryRequestBody(DnsMessage.query(hostname, type)))
-        } else {
-          val queryParameter = DnsMessage.query(hostname, type).asQueryParameter()
-          val requestUrl = dnsUrl.newBuilder().addQueryParameter("dns", queryParameter).build()
-          url(requestUrl)
-        }
-      }.build()
+  ): Call =
+    client.newCall(
+      request =
+        Request
+          .Builder()
+          .header("Accept", DNS_MESSAGE.toString())
+          .apply {
+            val dnsUrl = this@DnsOverHttps.url
+            if (post) {
+              url(dnsUrl)
+              cacheUrlOverride(
+                dnsUrl
+                  .newBuilder()
+                  .addQueryParameter("hostname", hostname)
+                  .build(),
+              )
+              post(QueryRequestBody(DnsMessage.query(hostname, type)))
+            } else {
+              val queryParameter = DnsMessage.query(hostname, type).asQueryParameter()
+              val requestUrl =
+                dnsUrl
+                  .newBuilder()
+                  .addQueryParameter("dns", queryParameter)
+                  .build()
+              url(requestUrl)
+            }
+          }.build(),
+    )
 
   class Builder {
     internal var client: OkHttpClient? = null
