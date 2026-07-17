@@ -22,7 +22,7 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Call
 import okhttp3.Callback
-import okhttp3.Dns2
+import okhttp3.Dns
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.internal.OkHttpInternalApi
@@ -33,46 +33,27 @@ import okhttp3.internal.testAndSet
 // TODO: honor Https.priority and Https.targetName. Create new calls!
 
 /**
- * Implements [Dns2.Call] by making multiple HTTPS calls.
+ * Implements [Dns.Call] by making multiple HTTPS calls.
  */
 internal class DnsOverHttpsCall(
-  private val dnsOverHttps: DnsOverHttps,
-  override val request: Dns2.Request,
-) : Dns2.Call,
+  override val request: Dns.Request,
+  private val calls: List<Call>,
+  private val canceledException: IOException?,
+) : Dns.Call,
   Callback {
+  @Volatile private var canceled = false
   private val state = AtomicReference<State>(State.Idle)
 
-  override fun enqueue(callback: Dns2.Callback) {
-    val calls =
-      buildList {
-        if (dnsOverHttps.includeHttps) {
-          add(dnsOverHttps.createCall(request.hostname, TYPE_HTTPS))
-        }
-
-        add(dnsOverHttps.createCall(request.hostname, TYPE_A))
-
-        if (dnsOverHttps.includeIPv6) {
-          add(dnsOverHttps.createCall(request.hostname, TYPE_AAAA))
-        }
-      }
-
+  override fun enqueue(callback: Dns.Callback) {
     val running = State.Running(callback, calls)
 
     val previous = state.testAndSet(running) { it is State.Idle }
-    when (previous) {
-      is State.Idle -> {
-        for (call in calls) {
-          call.enqueue(this)
-        }
-      }
+    check(previous is State.Idle) {
+      "already enqueued"
+    }
 
-      is State.Running, State.Complete -> {
-        throw IllegalStateException("already enqueued")
-      }
-
-      State.Canceled -> {
-        callback.onFailure(this, IOException("canceled"))
-      }
+    for (call in calls) {
+      call.enqueue(this)
     }
   }
 
@@ -90,7 +71,11 @@ internal class DnsOverHttpsCall(
           ?: return // Already complete or canceled; nothing to do.
 
       val newRunningCalls = previous.runningCalls - call
-      val allFailures = previous.delayedFailures + e
+      val allFailures =
+        when {
+          canceledException != null -> listOf(canceledException)
+          else -> previous.delayedFailures + e
+        }
       val next =
         when {
           newRunningCalls.isEmpty() -> {
@@ -125,16 +110,16 @@ internal class DnsOverHttpsCall(
   ) {
     val resourceRecords =
       try {
-        dnsOverHttps.decodeResponse(response)
+        decodeResponse(response)
       } catch (e: IOException) {
         return onFailure(call, e)
       }
 
-    val dns2Records =
+    val dnsRecords =
       resourceRecords.map { resourceRecord ->
         when (resourceRecord) {
           is ResourceRecord.Https -> {
-            Dns2.Record.ServiceMetadata(
+            Dns.Record.ServiceMetadata(
               hostname = request.hostname,
               alpnIds =
                 resourceRecord.alpnIds?.mapNotNull { alpnId ->
@@ -151,7 +136,7 @@ internal class DnsOverHttpsCall(
           }
 
           is ResourceRecord.IpAddress -> {
-            Dns2.Record.IpAddress(
+            Dns.Record.IpAddress(
               hostname = request.hostname,
               address = resourceRecord.address,
             )
@@ -165,9 +150,10 @@ internal class DnsOverHttpsCall(
           ?: return // Already complete or canceled; nothing to do.
 
       val newRunningCalls = previous.runningCalls - call
+      val lastRunningCall = newRunningCalls.isEmpty()
       val next =
         when {
-          newRunningCalls.isEmpty() -> {
+          lastRunningCall -> {
             State.Complete
           }
 
@@ -182,39 +168,51 @@ internal class DnsOverHttpsCall(
 
       if (!state.compareAndSet(previous, next)) continue // Lost a race; retry.
 
-      previous.callback.onRecords(
-        call = this,
-        last = newRunningCalls.isEmpty(),
-        records = dns2Records,
-      )
+      val emitDelayedFailures = lastRunningCall && previous.delayedFailures.isNotEmpty()
+      val lastEvent = lastRunningCall && !emitDelayedFailures
+      if (dnsRecords.isNotEmpty() || lastEvent) {
+        previous.callback.onRecords(
+          call = this,
+          last = lastEvent,
+          records = dnsRecords,
+        )
+      }
+      if (emitDelayedFailures) {
+        previous.callback.onFailure(
+          call = this,
+          exceptions = previous.delayedFailures,
+        )
+      }
 
       return
     }
   }
 
   override fun cancel() {
-    val previous = state.testAndSet(State.Canceled) { it is State.Running || it == State.Idle }
-    (previous as? State.Running)?.callback?.onFailure(this, IOException("canceled"))
+    if (canceled) return // Already canceled.
+
+    canceled = true
+    for (call in calls) {
+      call.cancel()
+    }
   }
 
-  override fun isCanceled() = state.get() is State.Canceled
+  override fun isCanceled() = canceled
 
   private sealed interface State {
     object Idle : State
 
     class Running(
-      val callback: Dns2.Callback,
+      val callback: Dns.Callback,
       val runningCalls: List<Call>,
       val delayedFailures: List<IOException> = listOf(),
     ) : State
 
     object Complete : State
-
-    object Canceled : State
   }
 }
 
-internal fun Dns2.Callback.onFailure(
+internal fun Dns.Callback.onFailure(
   call: DnsOverHttpsCall,
   exceptions: List<IOException>,
 ) {
