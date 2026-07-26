@@ -205,9 +205,18 @@ class RealDnsCache(
         val previous = entry.state.get()
         val sentAt = previous.inFlightCall!!.sentAt
         val timeToLive =
-          (dnsResponse.answers.minOfOrNull { it.timeToLive } ?: 0)
-            .seconds
-            .coerceIn(minimumTimeToLive, maximumTimeToLive)
+          when {
+            dnsResponse.answers.isEmpty() -> {
+              failureTimeToLive
+            }
+
+            else -> {
+              dnsResponse.answers
+                .minOf { it.timeToLive }
+                .seconds
+                .coerceIn(minimumTimeToLive, maximumTimeToLive)
+            }
+          }
         val revalidateDelay = (timeToLive - revalidateBeforeExpire).coerceAtLeast(0.seconds)
 
         val next =
